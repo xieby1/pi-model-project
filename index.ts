@@ -1,5 +1,6 @@
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   getAgentDir,
@@ -31,6 +32,31 @@ function readSettings(file: string): Record<string, unknown> {
   return settings;
 }
 
+function hasModelSetting(settings: Record<string, unknown>): boolean {
+  return Boolean(settings.defaultProvider || settings.defaultModel || settings.defaultThinkingLevel);
+}
+
+function nearestAncestorModelSettings(cwd: string): string | undefined {
+  if (cwd === homedir()) return undefined;
+  for (let dir = dirname(cwd); ; dir = dirname(dir)) {
+    const file = join(dir, ".pi", "settings.json");
+    if (existsSync(file)) {
+      try {
+        if (hasModelSetting(readSettings(file))) return file;
+      } catch {
+        // An invalid ancestor is not a save target; keep looking or save locally.
+      }
+    }
+    if (dir === homedir() || dir === dirname(dir)) return undefined;
+  }
+}
+
+function rejectLinkedSettings(file: string): void {
+  if (lstatSync(file, { throwIfNoEntry: false })?.isSymbolicLink()) {
+    throw new Error(`Refusing to replace symlinked settings: ${file}`);
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("model-project", {
     description: "Select and save the model for this project using Pi's model picker",
@@ -43,10 +69,10 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("/model-project requires Pi's interactive terminal.", "error");
         return;
       }
-      const file = join(ctx.cwd, ".pi", "settings.json");
+      const localFile = join(ctx.cwd, ".pi", "settings.json");
       let switched = false;
       try {
-        const settings = readSettings(file);
+        const settings = readSettings(localFile);
         const registry = ctx.modelRegistry;
         // Pi 1.2's exported picker needs these four runtime methods, not the full registry.
         const runtime = {
@@ -66,17 +92,34 @@ export default function (pi: ExtensionAPI) {
         );
         if (!model) return;
         if (!ctx.isProjectTrusted()) throw new Error("Project is no longer trusted");
+        const current = readSettings(localFile);
+        const parentFile = !hasModelSetting(current) ? nearestAncestorModelSettings(ctx.cwd) : undefined;
+        let file = localFile;
+        if (parentFile) {
+          const localChoice = `Save locally: ${localFile}`;
+          const parentChoice = `Save to ancestor (shared): ${parentFile}`;
+          const choice = await ctx.ui.select(
+            "Parent model settings found. Where should this default be saved?\nAncestor defaults apply in subfolders only with an ancestor loader (e.g. pi-directory-models).",
+            [localChoice, parentChoice, "Cancel"],
+          );
+          if (choice === parentChoice) file = parentFile;
+          else if (choice !== localChoice) return;
+        }
+        if (!ctx.isProjectTrusted()) throw new Error("Project is no longer trusted");
         const beforeSwitch = readSettings(file);
+        rejectLinkedSettings(file);
         const globalSettings = SettingsManager.create(ctx.cwd, getAgentDir()).getGlobalSettings();
-        const patterns = beforeSwitch.enabledModels === undefined ? globalSettings.enabledModels : beforeSwitch.enabledModels;
-        if (patterns !== undefined) {
-          if (!Array.isArray(patterns) || patterns.some((pattern) => typeof pattern !== "string")) {
-            throw new Error("enabledModels must be an array of strings");
-          }
-          const scopeRuntime = { getAvailable: async () => registry.getAvailable() };
-          const { scopedModels } = await resolveModelScopeWithDiagnostics(patterns, scopeRuntime as unknown as ModelRuntime);
-          if (scopedModels.length && !scopedModels.some((s) => s.model.provider === model.provider && s.model.id === model.id)) {
-            throw new Error(`${model.provider}/${model.id} is outside enabledModels; change that setting before saving this default`);
+        for (const settingsToCheck of file === localFile ? [beforeSwitch] : [readSettings(localFile), beforeSwitch]) {
+          const patterns = settingsToCheck.enabledModels === undefined ? globalSettings.enabledModels : settingsToCheck.enabledModels;
+          if (patterns !== undefined) {
+            if (!Array.isArray(patterns) || patterns.some((pattern) => typeof pattern !== "string")) {
+              throw new Error("enabledModels must be an array of strings");
+            }
+            const scopeRuntime = { getAvailable: async () => registry.getAvailable() };
+            const { scopedModels } = await resolveModelScopeWithDiagnostics(patterns, scopeRuntime as unknown as ModelRuntime);
+            if (scopedModels.length && !scopedModels.some((s) => s.model.provider === model.provider && s.model.id === model.id)) {
+              throw new Error(`${model.provider}/${model.id} is outside enabledModels; change that setting before saving this default`);
+            }
           }
         }
         if (!(await pi.setModel(model))) throw new Error(`Could not switch to ${model.provider}/${model.id}`);
@@ -87,6 +130,7 @@ export default function (pi: ExtensionAPI) {
           // Match Pi's settings lock; no await while holding it, so native writers cannot interleave.
           const release = lockfile.lockSync(file, { realpath: false });
           try {
+            rejectLinkedSettings(file);
             const latest = readSettings(file);
             if (JSON.stringify(latest.enabledModels) !== JSON.stringify(beforeSwitch.enabledModels)) {
               throw new Error("enabledModels changed while switching; run /model-project again");

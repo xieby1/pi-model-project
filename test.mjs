@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readlink, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -29,22 +29,30 @@ const models = ["deepseek", "proxy"].map((provider) => ({
   provider, id: "deepseek-chat", name: "DeepSeek", reasoning: false,
 }));
 
-async function fixture({ trusted = true, mode = "tui", switchOK = true, keys = ["\r"], settings, beforeSelect, onSwitch, refreshPending = false, scopedModels = models.map((model) => ({ model })) } = {}) {
-  const cwd = await mkdtemp(join(root, "project-"));
+async function fixture({ trusted = true, mode = "tui", switchOK = true, keys = ["\r"], settings, parentSettings, grandparentSettings, saveChoice = "local", beforeSelect, onSwitch, refreshPending = false, scopedModels = models.map((model) => ({ model })) } = {}) {
+  const grandparent = await mkdtemp(join(root, "grandparent-"));
+  const parent = join(grandparent, "parent");
+  const cwd = join(parent, "project");
+  await mkdir(cwd, { recursive: true });
   const file = join(cwd, ".pi/settings.json");
-  if (settings !== undefined) {
-    await mkdir(join(cwd, ".pi"));
-    await writeFile(file, settings);
+  const parentFile = join(parent, ".pi/settings.json");
+  const grandparentFile = join(grandparent, ".pi/settings.json");
+  for (const [path, content] of [[file, settings], [parentFile, parentSettings], [grandparentFile, grandparentSettings]]) {
+    if (content !== undefined) {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, content);
+    }
   }
   const commands = new Map();
   const notifications = [];
   const switches = [];
+  const choices = [];
   let picker, rendered, refreshSignal, disposed = false;
   register({
     registerCommand: (name, command) => commands.set(name, command),
     setModel: async (model) => {
       switches.push(model);
-      if (onSwitch) await onSwitch({ cwd, file });
+      if (onSwitch) await onSwitch({ cwd, file, parentFile });
       return switchOK;
     },
   });
@@ -63,6 +71,11 @@ async function fixture({ trusted = true, mode = "tui", switchOK = true, keys = [
     },
     ui: {
       notify: (message, level) => notifications.push({ message, level }),
+      select: async (title, options) => {
+        choices.push({ title, options });
+        assert.equal(options.length, 3);
+        return saveChoice === "local" ? options[0] : saveChoice === "parent" ? options[1] : saveChoice === "cancel" ? options[2] : undefined;
+      },
       custom: async (factory, options) => {
         assert.equal(options?.overlay ?? false, false, "use the same inline placement as /model");
         let finish;
@@ -74,7 +87,7 @@ async function fixture({ trusted = true, mode = "tui", switchOK = true, keys = [
         picker.focused = true;
         await new Promise((resolve) => setImmediate(resolve));
         rendered = picker.render(120).join("\n");
-        if (beforeSelect) await beforeSelect({ ctx, file });
+        if (beforeSelect) await beforeSelect({ ctx, file, parentFile });
         for (const key of keys) picker.handleInput(key);
         try { return await result; } finally { picker.dispose(); }
       },
@@ -82,7 +95,7 @@ async function fixture({ trusted = true, mode = "tui", switchOK = true, keys = [
   };
   assert.deepEqual([...commands.keys()], ["model-project"]);
   await commands.get("model-project").handler("", ctx);
-  return { cwd, file, switches, notifications, picker, rendered, refreshSignal, disposed };
+  return { cwd, file, parentFile, grandparentFile, switches, choices, notifications, picker, rendered, refreshSignal, disposed };
 }
 
 test("native picker displays providers and saves the selected duplicate model", async () => {
@@ -104,6 +117,170 @@ test("save preserves unrelated settings and thinking defaults", async () => {
   assert.deepEqual(JSON.parse(await readFile(f.file, "utf8")), {
     defaultProvider: "deepseek", defaultModel: "deepseek-chat", defaultThinkingLevel: "high", retry: { maxRetries: 8 },
   });
+});
+
+test("ancestor model defaults prompt for local save without changing the shared file", async () => {
+  const parentSettings = '{"defaultProvider":"proxy","defaultModel":"deepseek-chat","theme":"dark"}';
+  const f = await fixture({ parentSettings });
+  assert.equal(f.choices.length, 1);
+  assert.ok(f.choices[0].options[0].includes(f.file));
+  assert.ok(f.choices[0].options[1].includes(f.parentFile));
+  assert.match(f.choices[0].title, /ancestor load/i);
+  assert.equal(await readFile(f.parentFile, "utf8"), parentSettings);
+  assert.deepEqual(JSON.parse(await readFile(f.file, "utf8")), { defaultProvider: "deepseek", defaultModel: "deepseek-chat" });
+});
+
+test("explicit ancestor save updates nearest model settings, preserving other fields", async () => {
+  const grandparentSettings = '{"defaultProvider":"deepseek","defaultModel":"old"}';
+  const f = await fixture({
+    parentSettings: '{"theme":"light"}', grandparentSettings, saveChoice: "parent",
+  });
+  assert.equal(f.choices.length, 1);
+  assert.ok(f.choices[0].options[1].includes(f.grandparentFile));
+  assert.deepEqual(JSON.parse(await readFile(f.grandparentFile, "utf8")), { defaultProvider: "deepseek", defaultModel: "deepseek-chat" });
+  assert.equal(await readFile(f.parentFile, "utf8"), '{"theme":"light"}');
+  await assert.rejects(readFile(f.file), { code: "ENOENT" });
+  assert.ok(f.notifications.some((n) => n.message.includes(f.grandparentFile)));
+});
+
+test("malformed ancestor does not prevent saving locally", async () => {
+  const f = await fixture({ parentSettings: "{bad json" });
+  assert.deepEqual(f.choices, []);
+  assert.equal(f.switches[0], models[0]);
+  assert.equal(await readFile(f.parentFile, "utf8"), "{bad json");
+  assert.equal(JSON.parse(await readFile(f.file, "utf8")).defaultModel, "deepseek-chat");
+});
+
+test("malformed ancestor is skipped in favor of the next valid ancestor", async () => {
+  const f = await fixture({
+    parentSettings: "{bad json", grandparentSettings: '{"defaultProvider":"proxy","defaultModel":"old"}',
+    saveChoice: "parent",
+  });
+  assert.equal(f.choices.length, 1);
+  assert.ok(f.choices[0].options[1].includes(f.grandparentFile));
+  assert.equal(await readFile(f.parentFile, "utf8"), "{bad json");
+  assert.equal(JSON.parse(await readFile(f.grandparentFile, "utf8")).defaultModel, "deepseek-chat");
+});
+
+test("nearest ancestor wins and parent save preserves thinking and unrelated settings", async () => {
+  const f = await fixture({
+    parentSettings: '{"defaultProvider":"proxy","defaultModel":"old","defaultThinkingLevel":"high","theme":"dark"}',
+    grandparentSettings: '{"defaultProvider":"deepseek","defaultModel":"old"}', saveChoice: "parent",
+  });
+  assert.ok(f.choices[0].options[1].includes(f.parentFile));
+  assert.deepEqual(JSON.parse(await readFile(f.parentFile, "utf8")), {
+    defaultProvider: "deepseek", defaultModel: "deepseek-chat", defaultThinkingLevel: "high", theme: "dark",
+  });
+  assert.equal(await readFile(f.grandparentFile, "utf8"), '{"defaultProvider":"deepseek","defaultModel":"old"}');
+});
+
+test("thinking-only settings stop the ancestor search at the nearest matching folder", async () => {
+  const grandparentSettings = '{"defaultProvider":"proxy","defaultModel":"old"}';
+  const f = await fixture({
+    parentSettings: '{"defaultThinkingLevel":"high"}', grandparentSettings, saveChoice: "parent",
+  });
+  assert.ok(f.choices[0].options[1].includes(f.parentFile));
+  assert.deepEqual(JSON.parse(await readFile(f.parentFile, "utf8")), {
+    defaultProvider: "deepseek", defaultModel: "deepseek-chat", defaultThinkingLevel: "high",
+  });
+  assert.equal(await readFile(f.grandparentFile, "utf8"), grandparentSettings);
+});
+
+test("local thinking-only settings do not offer an ancestor save", async () => {
+  const f = await fixture({
+    settings: '{"defaultThinkingLevel":"low"}',
+    parentSettings: '{"defaultProvider":"proxy","defaultModel":"old"}',
+  });
+  assert.deepEqual(f.choices, []);
+  assert.deepEqual(JSON.parse(await readFile(f.file, "utf8")), {
+    defaultProvider: "deepseek", defaultModel: "deepseek-chat", defaultThinkingLevel: "low",
+  });
+});
+
+test("linked ancestor settings stay linked and unchanged", async () => {
+  let shared;
+  const f = await fixture({ saveChoice: "parent", beforeSelect: async ({ parentFile }) => {
+    shared = join(dirname(parentFile), "shared.json");
+    await mkdir(dirname(parentFile), { recursive: true });
+    await writeFile(shared, '{"defaultProvider":"proxy","defaultModel":"old"}');
+    await symlink(shared, parentFile);
+  } });
+  assert.equal(f.choices.length, 1);
+  assert.deepEqual(f.switches, []);
+  assert.equal(await readlink(f.parentFile), shared);
+  assert.equal(JSON.parse(await readFile(shared, "utf8")).defaultModel, "old");
+  assert.ok(f.notifications.some((n) => n.level === "error" && n.message.includes("symlink")));
+});
+
+test("ancestor linked during model switch is not replaced", async () => {
+  let shared;
+  const f = await fixture({
+    parentSettings: '{"defaultProvider":"proxy","defaultModel":"old"}', saveChoice: "parent",
+    onSwitch: async ({ parentFile }) => {
+      shared = join(dirname(parentFile), "shared.json");
+      await writeFile(shared, '{"defaultProvider":"proxy","defaultModel":"old"}');
+      await rm(parentFile);
+      await symlink(shared, parentFile);
+    },
+  });
+  assert.equal(f.switches.length, 1);
+  assert.equal(await readlink(f.parentFile), shared);
+  assert.equal(JSON.parse(await readFile(shared, "utf8")).defaultModel, "old");
+  assert.ok(f.notifications.some((n) => n.level === "error" && n.message.includes("symlink")));
+});
+
+test("cancelling the save target leaves both settings and session unchanged", async () => {
+  for (const saveChoice of ["cancel", "escape"]) {
+    const parentSettings = '{"defaultProvider":"proxy","defaultModel":"old"}';
+    const f = await fixture({ parentSettings, saveChoice });
+    assert.equal(f.choices.length, 1);
+    assert.deepEqual(f.switches, []);
+    assert.equal(await readFile(f.parentFile, "utf8"), parentSettings);
+    await assert.rejects(readFile(f.file), { code: "ENOENT" });
+  }
+});
+
+test("local model defaults never prompt to overwrite an ancestor", async () => {
+  const f = await fixture({
+    settings: '{"defaultModel":"old"}',
+    parentSettings: '{"defaultProvider":"proxy","defaultModel":"old"}',
+  });
+  assert.deepEqual(f.choices, []);
+  assert.deepEqual(JSON.parse(await readFile(f.file, "utf8")), { defaultProvider: "deepseek", defaultModel: "deepseek-chat" });
+  assert.equal(JSON.parse(await readFile(f.parentFile, "utf8")).defaultModel, "old");
+});
+
+test("a local default added during the picker keeps the save local", async () => {
+  const parentSettings = '{"defaultProvider":"proxy","defaultModel":"old"}';
+  const f = await fixture({
+    parentSettings, saveChoice: "parent",
+    beforeSelect: async ({ file }) => {
+      await mkdir(dirname(file), { recursive: true });
+      await writeFile(file, '{"defaultProvider":"proxy","defaultModel":"old"}');
+    },
+  });
+  assert.deepEqual(f.choices, []);
+  assert.equal(await readFile(f.parentFile, "utf8"), parentSettings);
+  assert.equal(JSON.parse(await readFile(f.file, "utf8")).defaultModel, "deepseek-chat");
+});
+
+test("ancestor enabledModels prevents saving an invalid shared default", async () => {
+  const parentSettings = '{"defaultProvider":"proxy","defaultModel":"old","enabledModels":["proxy/*"]}';
+  const f = await fixture({ parentSettings, saveChoice: "parent" });
+  assert.deepEqual(f.switches, []);
+  assert.equal(await readFile(f.parentFile, "utf8"), parentSettings);
+  await assert.rejects(readFile(f.file), { code: "ENOENT" });
+  assert.ok(f.notifications.some((n) => n.level === "error" && n.message.includes("enabledModels")));
+});
+
+test("local enabledModels still limits the current session when saving to an ancestor", async () => {
+  const parentSettings = '{"defaultProvider":"deepseek","defaultModel":"old"}';
+  const settings = '{"enabledModels":["proxy/*"]}';
+  const f = await fixture({ settings, parentSettings, saveChoice: "parent" });
+  assert.deepEqual(f.switches, []);
+  assert.equal(await readFile(f.parentFile, "utf8"), parentSettings);
+  assert.equal(await readFile(f.file, "utf8"), settings);
+  assert.ok(f.notifications.some((n) => n.level === "error" && n.message.includes("enabledModels")));
 });
 
 test("Escape leaves the session and project unchanged", async () => {

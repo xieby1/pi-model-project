@@ -1,8 +1,8 @@
 # pi-model-project
 
-`/model-project` opens Pi's **own `/model` picker**, then switches the current session to the selected model and saves its `defaultProvider` and `defaultModel` to `<cwd>/.pi/settings.json`. The native picker displays provider badges, so models with the same name and ID from different providers are distinguishable. Press Escape to leave both the session and settings unchanged.
+`/model-project` opens Pi's **own `/model` picker**, then switches the current session to the selected model and saves its `defaultProvider` and `defaultModel`. It normally saves to `<cwd>/.pi/settings.json`. If that file has no model or thinking default and a parent `.pi/settings.json` does, it asks after the picker whether to save locally (default), update the nearest parent's shared settings, or cancel. The prompt shows both paths and warns that Pi only uses a parent's defaults in subfolders when an ancestor-loading extension is installed. A parent file is **not** assumed to be the source of the current session model. Escape at either prompt leaves both the session and settings unchanged. The native picker displays provider badges, so models with the same name and ID from different providers are distinguishable.
 
-Only the project default model is changed: global settings, `defaultThinkingLevel`, and unrelated project settings are preserved. The command requires a trusted project and Pi's interactive terminal (TUI); it does not provide a picker in RPC/print/JSON modes. It checks `enabledModels` before switching, refuses malformed settings, and uses Pi's settings lock plus an atomic replacement to save. If saving fails after switching, it reports that the session changed but the default did not.
+Only the chosen settings file's default model is changed: global settings, `defaultThinkingLevel`, and unrelated settings are preserved. The command requires a trusted project and Pi's interactive terminal (TUI); it does not provide a picker in RPC/print/JSON modes. It checks `enabledModels` before switching, refuses malformed selected settings, skips unreadable ancestor candidates, and refuses to replace symlinked settings files. Saving uses Pi's settings lock plus an atomic replacement. If saving fails after switching, it reports that the session changed but the default did not.
 
 ## Why another extension?
 
@@ -31,7 +31,7 @@ After publishing the Git repository, you can install it from Git instead (replac
 pi install git:github.com/xieby1/pi-model-project
 ```
 
-The extension does not create a new model registry or change Pi's built-in `/model` behavior. Project trust and an interactive terminal are required to save a choice.
+The extension does not create a new model registry, change Pi's built-in `/model` behavior, or enable ancestor inheritance on startup. For a shared parent model default to apply when launching Pi from a subfolder, use an ancestor model loader such as [`@claaslange/pi-directory-models`](https://github.com/claaslange/pi-directory-models). Project trust and an interactive terminal are required to save a choice.
 
 ## Test
 
@@ -42,4 +42,4 @@ npm ci
 npm test
 ```
 
-The tests drive Pi's actual picker, including duplicate model names across providers, cancellation, trust, settings preservation and concurrent writes. No Home Manager or Nix configuration is part of this standalone extension.
+The tests drive Pi's actual picker, including duplicate model names across providers, local and ancestor save targets, cancellation, trust, settings preservation and concurrent writes. No Home Manager or Nix configuration is part of this standalone extension.
