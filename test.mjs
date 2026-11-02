@@ -6,7 +6,7 @@ import { after, test } from "node:test";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { ModelSelectorComponent, SettingsManager, getPackageDir, initTheme } from "@earendil-works/pi-coding-agent";
+import { ModelSelectorComponent, ProjectTrustStore, SettingsManager, getPackageDir, initTheme } from "@earendil-works/pi-coding-agent";
 import register from "./index.ts";
 
 initTheme("dark");
@@ -29,7 +29,7 @@ const models = ["deepseek", "proxy"].map((provider) => ({
   provider, id: "deepseek-chat", name: "DeepSeek", reasoning: false,
 }));
 
-async function fixture({ trusted = true, mode = "tui", switchOK = true, keys = ["\r"], settings, parentSettings, grandparentSettings, saveChoice = "local", beforeSelect, onSwitch, refreshPending = false, scopedModels = models.map((model) => ({ model })) } = {}) {
+async function fixture({ trusted = true, mode = "tui", switchOK = true, keys = ["\r"], settings, parentSettings, grandparentSettings, saveChoice = "local", beforeSelect, beforeStart, onSwitch, refreshPending = false, scopedModels = models.map((model) => ({ model })), start = false, reason = "startup", branch = [], ancestorTrust = true, childTrust, thinkingLevel } = {}) {
   const grandparent = await mkdtemp(join(root, "grandparent-"));
   const parent = join(grandparent, "parent");
   const cwd = join(parent, "project");
@@ -44,20 +44,33 @@ async function fixture({ trusted = true, mode = "tui", switchOK = true, keys = [
     }
   }
   const commands = new Map();
+  const handlers = new Map();
   const notifications = [];
   const switches = [];
+  const thinkingSwitches = [];
+  let activeThinkingLevel = thinkingLevel;
+  if (start) {
+    const trust = new ProjectTrustStore(dirname(globalFile));
+    if (ancestorTrust !== null) trust.set(grandparent, ancestorTrust);
+    if (childTrust !== undefined) trust.set(cwd, childTrust);
+  }
   const choices = [];
   let picker, rendered, refreshSignal, disposed = false;
   register({
     registerCommand: (name, command) => commands.set(name, command),
+    on: (name, handler) => handlers.set(name, handler),
+    setThinkingLevel: (level) => { activeThinkingLevel = level; thinkingSwitches.push(level); },
     setModel: async (model) => {
       switches.push(model);
+      if (start && switchOK && thinkingLevel !== undefined) activeThinkingLevel = "low";
       if (onSwitch) await onSwitch({ cwd, file, parentFile });
       return switchOK;
     },
   });
   const ctx = {
     cwd, mode, model: models[0], scopedModels,
+    get thinkingLevel() { return activeThinkingLevel; },
+    sessionManager: { getBranch: () => branch },
     isProjectTrusted: () => trusted,
     modelRegistry: {
       getAvailable: () => models,
@@ -94,9 +107,128 @@ async function fixture({ trusted = true, mode = "tui", switchOK = true, keys = [
     },
   };
   assert.deepEqual([...commands.keys()], ["model-project"]);
-  await commands.get("model-project").handler("", ctx);
-  return { cwd, file, parentFile, grandparentFile, switches, choices, notifications, picker, rendered, refreshSignal, disposed };
+  if (start) {
+    if (beforeStart) await beforeStart({ cwd, file, parentFile, grandparentFile });
+    await handlers.get("session_start")({ type: "session_start", reason }, ctx);
+  } else await commands.get("model-project").handler("", ctx);
+  return { cwd, file, parentFile, grandparentFile, switches, thinkingSwitches, choices, notifications, picker, rendered, refreshSignal, disposed };
 }
+
+test("startup loads nearest ancestor model without writing settings", async () => {
+  const parentSettings = '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}';
+  const f = await fixture({ start: true, parentSettings, branch: [{ type: "model_change" }, { type: "thinking_level_change" }] });
+  assert.deepEqual(f.switches, [models[1]]);
+  assert.deepEqual(f.thinkingSwitches, []);
+  assert.equal(f.picker, undefined);
+  assert.equal(await readFile(f.parentFile, "utf8"), parentSettings);
+  await assert.rejects(readFile(f.file), { code: "ENOENT" });
+});
+
+test("startup respects local defaults and nearest ancestor", async () => {
+  const nearest = await fixture({ start: true, parentSettings: '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}', grandparentSettings: '{"defaultProvider":"deepseek","defaultModel":"deepseek-chat"}' });
+  assert.deepEqual(nearest.switches, [models[1]]);
+  for (const settings of ['{"defaultProvider":"deepseek","defaultModel":"deepseek-chat"}', '{"defaultThinkingLevel":"low"}']) {
+    const f = await fixture({ start: true, settings, parentSettings: '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}' });
+    assert.deepEqual(f.switches, []);
+  }
+  const thinking = await fixture({ start: true, parentSettings: '{"defaultThinkingLevel":"high"}', grandparentSettings: '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}' });
+  assert.deepEqual(thinking.switches, []);
+  const distant = await fixture({ start: true, parentSettings: '{"theme":"dark"}', grandparentSettings: '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}' });
+  assert.deepEqual(distant.switches, [models[1]]);
+  const alreadySelected = await fixture({ start: true, parentSettings: '{"defaultProvider":"deepseek","defaultModel":"deepseek-chat"}' });
+  assert.deepEqual(alreadySelected.switches, []);
+});
+
+test("startup skips untrusted projects and existing sessions", async () => {
+  for (const options of [
+    { trusted: false },
+    { reason: "resume" },
+    { reason: "fork" },
+    { reason: "reload" },
+    { branch: [{ type: "message" }] },
+    { branch: [{ type: "model_change" }, { type: "model_change" }] },
+  ]) {
+    const f = await fixture({ start: true, parentSettings: '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}', ...options });
+    assert.deepEqual(f.switches, [], JSON.stringify(options));
+  }
+  const fresh = await fixture({ start: true, reason: "new", mode: "print", parentSettings: '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}' });
+  assert.deepEqual(fresh.switches, [models[1]]);
+});
+
+test("startup ignores bad or unavailable ancestor model and respects scope", async () => {
+  const inherited = '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}';
+  const malformed = await fixture({ start: true, parentSettings: '{bad', grandparentSettings: inherited });
+  assert.deepEqual(malformed.switches, [models[1]]);
+  for (const options of [
+    { parentSettings: '{"defaultProvider":"proxy","defaultModel":"unknown"}' },
+    { parentSettings: inherited, scopedModels: [{ model: models[0] }] },
+    { parentSettings: inherited, switchOK: false },
+  ]) {
+    const f = await fixture({ start: true, ...options });
+    assert.deepEqual(f.switches.filter((m) => m === models[1]), options.switchOK === false ? [models[1]] : []);
+    await assert.rejects(readFile(f.file), { code: "ENOENT" });
+  }
+});
+
+test("explicit CLI model wins over ancestor default", async () => {
+  process.argv.push("--model", "deepseek/deepseek-chat");
+  try {
+    const f = await fixture({ start: true, parentSettings: '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}' });
+    assert.deepEqual(f.switches, []);
+  } finally {
+    process.argv.splice(-2);
+  }
+});
+
+test("explicit CLI thinking survives ancestor model selection", async () => {
+  process.argv.push("--thinking", "high");
+  try {
+    for (const thinkingLevel of ["high", "off"]) {
+      const f = await fixture({ start: true, thinkingLevel, scopedModels: [{ model: models[0] }, { model: models[1], thinkingLevel: "low" }], parentSettings: '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}' });
+      assert.deepEqual(f.switches, [models[1]]);
+      assert.deepEqual(f.thinkingSwitches, ["high"], "even when Pi clamped the initial model to off");
+    }
+  } finally {
+    process.argv.splice(-2);
+  }
+});
+
+test("selected model's scoped thinking level is retained", async () => {
+  const f = await fixture({ start: true, thinkingLevel: "low", scopedModels: [{ model: models[0] }, { model: models[1], thinkingLevel: "high" }], parentSettings: '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}' });
+  assert.deepEqual(f.switches, [models[1]]);
+  assert.deepEqual(f.thinkingSwitches, ["high"]);
+});
+
+test("ancestor loading requires trust in its source, including explicit denials", async () => {
+  const parentSettings = '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}';
+  for (const ancestorTrust of [null, false]) {
+    const f = await fixture({ start: true, parentSettings, ancestorTrust });
+    assert.deepEqual(f.switches, []);
+    if (ancestorTrust === null) assert.ok(f.notifications.some((n) => n.level === "warning" && n.message.includes("Trust")));
+    else assert.deepEqual(f.notifications, []);
+  }
+  const childTrusted = await fixture({ start: true, parentSettings, ancestorTrust: null, childTrust: true });
+  assert.deepEqual(childTrusted.switches, [], "trusting only the subfolder cannot approve its parent settings");
+  const childDenied = await fixture({ start: true, parentSettings, childTrust: false });
+  assert.deepEqual(childDenied.switches, []);
+  assert.deepEqual(childDenied.notifications, []);
+});
+
+test("trusted ancestor cannot load a symlinked settings file", async () => {
+  const f = await fixture({ start: true, parentSettings: '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}', beforeStart: async ({ parentFile }) => {
+    const untrusted = join(root, "external-settings.json");
+    await writeFile(untrusted, '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}');
+    await rm(parentFile);
+    await symlink(untrusted, parentFile);
+  } });
+  assert.deepEqual(f.switches, []);
+});
+
+test("startup does not load an ancestor through malformed local settings", async () => {
+  const f = await fixture({ start: true, settings: "{invalid", parentSettings: '{"defaultProvider":"proxy","defaultModel":"deepseek-chat"}' });
+  assert.deepEqual(f.switches, []);
+  assert.ok(f.notifications.some((n) => n.level === "warning"));
+});
 
 test("native picker displays providers and saves the selected duplicate model", async () => {
   const f = await fixture({ keys: ["\x1b[B", "\r"] });

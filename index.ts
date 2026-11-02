@@ -6,6 +6,8 @@ import {
   getAgentDir,
   getPackageDir,
   ModelSelectorComponent,
+  parseArgs,
+  ProjectTrustStore,
   resolveModelScopeWithDiagnostics,
   SettingsManager,
   withFileMutationQueue,
@@ -58,6 +60,41 @@ function rejectLinkedSettings(file: string): void {
 }
 
 export default function (pi: ExtensionAPI) {
+  pi.on("session_start", async (event, ctx) => {
+    if (!ctx.isProjectTrusted() || (event.reason !== "startup" && event.reason !== "new")) return;
+    // Preserve resumed sessions and explicit CLI model choices. New sessions have only Pi's initial model/thinking entries.
+    const branch = ctx.sessionManager.getBranch();
+    const cli = parseArgs(process.argv.slice(2));
+    if (branch.some((entry) => entry.type !== "model_change" && entry.type !== "thinking_level_change") ||
+        branch.filter((entry) => entry.type === "model_change").length > 1 || cli.model) return;
+    try {
+      if (hasModelSetting(readSettings(join(ctx.cwd, ".pi", "settings.json")))) return;
+      const file = nearestAncestorModelSettings(ctx.cwd);
+      if (!file) return;
+      const ancestor = dirname(dirname(file));
+      const trust = new ProjectTrustStore(getAgentDir());
+      if (trust.get(ctx.cwd) === false) return;
+      if (trust.get(ancestor) !== true) {
+        ctx.ui.notify(`Trust the ancestor directory ${ancestor} with /trust before loading its model.`, "warning");
+        return;
+      }
+      if (lstatSync(file).isSymbolicLink()) throw new Error(`Refusing to load symlinked ancestor settings: ${file}`);
+      const { defaultProvider, defaultModel } = readSettings(file);
+      if (typeof defaultProvider !== "string" || typeof defaultModel !== "string") return;
+      if (ctx.model?.provider === defaultProvider && ctx.model.id === defaultModel) return;
+      const model = ctx.modelRegistry.find(defaultProvider, defaultModel);
+      const scoped = ctx.scopedModels.find(({ model: candidate }) => candidate.provider === defaultProvider && candidate.id === defaultModel);
+      if (!model || (ctx.scopedModels.length && !scoped) || !(await pi.setModel(model))) {
+        ctx.ui.notify(`Could not load ancestor model ${defaultProvider}/${defaultModel} from ${file}`, "warning");
+      } else {
+        const thinking = cli.thinking ?? scoped?.thinkingLevel;
+        if (thinking !== undefined) pi.setThinkingLevel(thinking);
+      }
+    } catch (error) {
+      ctx.ui.notify(`Could not load ancestor model: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    }
+  });
+
   pi.registerCommand("model-project", {
     description: "Select and save the model for this project using Pi's model picker",
     handler: async (args, ctx) => {
@@ -99,7 +136,7 @@ export default function (pi: ExtensionAPI) {
           const localChoice = `Save locally: ${localFile}`;
           const parentChoice = `Save to ancestor (shared): ${parentFile}`;
           const choice = await ctx.ui.select(
-            "Parent model settings found. Where should this default be saved?\nAncestor defaults apply in subfolders only with an ancestor loader (e.g. pi-directory-models).",
+            "Parent model settings found. Where should this default be saved?\nAncestor loading in subfolders requires trusting the chosen ancestor with /trust.",
             [localChoice, parentChoice, "Cancel"],
           );
           if (choice === parentChoice) file = parentFile;

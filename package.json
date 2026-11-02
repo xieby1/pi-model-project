@@ -1,7 +1,7 @@
 {
   "name": "pi-model-project",
   "version": "0.1.0",
-  "description": "Save a project default model using Pi's native model picker",
+  "description": "Pick and save a project default model, and load ancestor model defaults",
   "keywords": ["pi-package", "pi-extension"],
   "repository": {
     "type": "git",

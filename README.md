@@ -1,12 +1,14 @@
 # pi-model-project
 
-`/model-project` opens Pi's **own `/model` picker**, then switches the current session to the selected model and saves its `defaultProvider` and `defaultModel`. It normally saves to `<cwd>/.pi/settings.json`. If that file has no model or thinking default and a parent `.pi/settings.json` does, it asks after the picker whether to save locally (default), update the nearest parent's shared settings, or cancel. The prompt shows both paths and warns that Pi only uses a parent's defaults in subfolders when an ancestor-loading extension is installed. A parent file is **not** assumed to be the source of the current session model. Escape at either prompt leaves both the session and settings unchanged. The native picker displays provider badges, so models with the same name and ID from different providers are distinguishable.
+`/model-project` opens Pi's **own `/model` picker**, then switches the current session to the selected model and saves its `defaultProvider` and `defaultModel`. It normally saves to `<cwd>/.pi/settings.json`. If that file has no model or thinking default and a parent `.pi/settings.json` does, it asks after the picker whether to save locally (default), update the nearest parent's shared settings, or cancel. The prompt shows both paths. Escape at either prompt leaves both the session and settings unchanged. The native picker displays provider badges, so models with the same name and ID from different providers are distinguishable.
+
+On startup and `/new`, this extension looks for the nearest ancestor `.pi/settings.json` containing a model or thinking default, **only if the current directory has no model or thinking default**. It loads that ancestor's model when both `defaultProvider` and `defaultModel` are set; a nearer thinking-only default blocks more distant model defaults. Pi itself handles the current directory's settings. To load a parent's model, first trust that ancestor in Pi (run `/trust` from its directory); trusting only a subfolder is insufficient, and an explicitly distrusted subfolder also blocks loading. Symlinked ancestor settings are not loaded. Only the ancestor's model is inherited, not its thinking or model scope settings; explicit `--thinking` and scoped model thinking levels are preserved. Unavailable or out-of-scope models are skipped. Loading does not override an explicitly selected CLI model, a resumed conversation, or an existing session on `/reload`. A parent file is **not** assumed to be the source of the current session model.
 
 Only the chosen settings file's default model is changed: global settings, `defaultThinkingLevel`, and unrelated settings are preserved. The command requires a trusted project and Pi's interactive terminal (TUI); it does not provide a picker in RPC/print/JSON modes. It checks `enabledModels` before switching, refuses malformed selected settings, skips unreadable ancestor candidates, and refuses to replace symlinked settings files. Saving uses Pi's settings lock plus an atomic replacement. If saving fails after switching, it reports that the session changed but the default did not.
 
 ## Why another extension?
 
-The requirement was deliberately narrow: **one project-scoped command with the exact model picker used by Pi's `/model`, without changing global or thinking defaults.** These comparisons describe the alternatives as evaluated in October 2026; upstream behavior may change.
+The requirement was deliberately narrow: **one project-scoped command with the exact model picker used by Pi's `/model`, plus loading saved ancestor model defaults in subfolders without changing global or thinking defaults.** These comparisons describe the alternatives as evaluated in October 2026; upstream behavior may change.
 
 | Alternative | What it offers | Why it did not fit |
 | --- | --- | --- |
@@ -31,7 +33,7 @@ After publishing the Git repository, you can install it from Git instead (replac
 pi install git:github.com/xieby1/pi-model-project
 ```
 
-The extension does not create a new model registry, change Pi's built-in `/model` behavior, or enable ancestor inheritance on startup. For a shared parent model default to apply when launching Pi from a subfolder, use an ancestor model loader such as [`@claaslange/pi-directory-models`](https://github.com/claaslange/pi-directory-models). Project trust and an interactive terminal are required to save a choice.
+The extension does not create a new model registry, change Pi's built-in `/model` behavior, or load other settings from ancestors. No separate ancestor-loading extension is required for model defaults. It requires an affirmative Pi trust decision for the ancestor settings source; trust and an interactive terminal are required to save a choice.
 
 ## Test
 
@@ -42,4 +44,4 @@ npm ci
 npm test
 ```
 
-The tests drive Pi's actual picker, including duplicate model names across providers, local and ancestor save targets, cancellation, trust, settings preservation and concurrent writes. No Home Manager or Nix configuration is part of this standalone extension.
+The tests drive Pi's actual picker and invoke the startup event handler, including duplicate model names across providers, local and ancestor save targets, inheritance, cancellation, trust, settings preservation and concurrent writes. No Home Manager or Nix configuration is part of this standalone extension.
