@@ -1,0 +1,20 @@
+{
+  "name": "pi-model-project",
+  "version": "0.1.0",
+  "description": "Save a project default model using Pi's native model picker",
+  "keywords": ["pi-package", "pi-extension"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xieby1/pi-model-project.git"
+  },
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.4.0"
+  },
+  "scripts": { "test": "node --test test.mjs" },
+  "engines": { "node": ">=22.19.0" }
+}

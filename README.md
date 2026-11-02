@@ -1,0 +1,45 @@
+# pi-model-project
+
+`/model-project` opens Pi's **own `/model` picker**, then switches the current session to the selected model and saves its `defaultProvider` and `defaultModel` to `<cwd>/.pi/settings.json`. The native picker displays provider badges, so models with the same name and ID from different providers are distinguishable. Press Escape to leave both the session and settings unchanged.
+
+Only the project default model is changed: global settings, `defaultThinkingLevel`, and unrelated project settings are preserved. The command requires a trusted project and Pi's interactive terminal (TUI); it does not provide a picker in RPC/print/JSON modes. It checks `enabledModels` before switching, refuses malformed settings, and uses Pi's settings lock plus an atomic replacement to save. If saving fails after switching, it reports that the session changed but the default did not.
+
+## Why another extension?
+
+The requirement was deliberately narrow: **one project-scoped command with the exact model picker used by Pi's `/model`, without changing global or thinking defaults.** These comparisons describe the alternatives as evaluated in October 2026; upstream behavior may change.
+
+| Alternative | What it offers | Why it did not fit |
+| --- | --- | --- |
+| [Pi's built-in `/model`](https://github.com/earendil-works/pi) | The desired native picker | Its save action (`Ctrl+S`) saves a global default. An ordinary extension shortcut cannot redirect that key while this picker owns input. |
+| [`@faiku/pi-default-model-switcher`](https://github.com/Faikuu/pi-default-model-switcher) | `/model-project` writes Pi's project settings; also offers session and global commands | Its separate picker looked inconsistent. Its terminal list omitted the provider from the displayed rows, so two providers offering the same model looked identical even though their underlying values differed. It also wrote `defaultThinkingLevel`, which we wanted to leave alone. |
+| [`@jasonish/pi-default-model`](https://www.npmjs.com/package/@jasonish/pi-default-model) | Project/global startup-model commands | It stores a separate `startupModel` setting and applies it at startup instead of saving Pi's native `defaultProvider` / `defaultModel` project defaults. |
+
+This extension reuses Pi's exported `ModelSelectorComponent`, with a small adapter between the extension's model registry and the picker's runtime interface. **Compatibility caveat:** that adapter depends on Pi's picker API; test `/model-project` against your installed Pi after upgrades.
+
+## Use
+
+From this repository, try it without installing:
+
+```sh
+pi -e .
+# Then run /model-project in Pi.
+```
+
+After publishing the Git repository, you can install it from Git instead (replace the GitHub account if needed):
+
+```sh
+pi install git:github.com/xieby1/pi-model-project
+```
+
+The extension does not create a new model registry or change Pi's built-in `/model` behavior. Project trust and an interactive terminal are required to save a choice.
+
+## Test
+
+Node.js 22.19+ is required; the development dependency matches the Pi 1.4.0 version against which these tests were written.
+
+```sh
+npm ci
+npm test
+```
+
+The tests drive Pi's actual picker, including duplicate model names across providers, cancellation, trust, settings preservation and concurrent writes. No Home Manager or Nix configuration is part of this standalone extension; the existing configuration remains in place until it can switch to a published npins source.
