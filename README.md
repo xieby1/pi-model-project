@@ -42,4 +42,4 @@ npm ci
 npm test
 ```
 
-The tests drive Pi's actual picker, including duplicate model names across providers, cancellation, trust, settings preservation and concurrent writes. No Home Manager or Nix configuration is part of this standalone extension; the existing configuration remains in place until it can switch to a published npins source.
+The tests drive Pi's actual picker, including duplicate model names across providers, cancellation, trust, settings preservation and concurrent writes. No Home Manager or Nix configuration is part of this standalone extension.
